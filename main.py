@@ -28,7 +28,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 import db
 
@@ -56,8 +56,8 @@ async def ciclo_de_vida(app: FastAPI):
 
 app = FastAPI(
     title="Calculadora API",
-    description="API didactica de 4 operaciones. Historial opcional en Postgres.",
-    version="3.0.0",
+    description="API didactica de 5 operaciones. Historial opcional en Postgres.",
+    version="3.1.0",
     lifespan=ciclo_de_vida,
 )
 
@@ -198,7 +198,7 @@ app.add_middleware(
 # rechaza solo todo lo que no encaje, con un 422 y un mensaje explicando que
 # campo esta mal.
 
-Operacion = Literal["suma", "resta", "multiplicacion", "division"]
+Operacion = Literal["suma", "resta", "multiplicacion", "division", "logaritmo"]
 
 # Tabla unica: cada operacion sabe su simbolo y como se calcula.
 # Un solo lugar para agregar una operacion nueva -> un solo lugar donde
@@ -213,6 +213,7 @@ OPERACIONES: dict[str, tuple[str, Callable[[float, float], float]]] = {
     "resta": ("-", lambda a, b: a - b),
     "multiplicacion": ("*", lambda a, b: a * b),
     "division": ("/", lambda a, b: a / b),
+    "logaritmo": ("log₁₀", lambda a, b: math.log10(a)),
 }
 
 
@@ -220,12 +221,12 @@ class OperacionRequest(BaseModel):
     """Lo que el front NOS MANDA."""
 
     a: float = Field(..., description="Primer operando (numero finito)")
-    b: float = Field(..., description="Segundo operando (numero finito)")
-    operacion: Operacion = Field(..., description="Que hacer con a y b")
+    b: float | None = Field(default=None, description="Segundo operando (numero finito; opcional para operaciones unarias)")
+    operacion: Operacion = Field(..., description="Que hacer con a (y b)")
 
     @field_validator("a", "b")
     @classmethod
-    def debe_ser_finito(cls, valor: float) -> float:
+    def debe_ser_finito(cls, valor: float | None) -> float | None:
         """
         Rechaza infinito y NaN en la ENTRADA.
 
@@ -238,9 +239,21 @@ class OperacionRequest(BaseModel):
         recien al serializar la respuesta — un 500 por un dato del cliente.
         Un dato de entrada invalido es 422, y se rechaza ACA, antes de calcular.
         """
-        if not math.isfinite(valor):
+        if valor is not None and not math.isfinite(valor):
             raise ValueError("debe ser un numero finito (ni infinito ni NaN)")
         return valor
+
+    @model_validator(mode="after")
+    def validar_operandos(self) -> "OperacionRequest":
+        """
+        Valida que el operando 'b' esté presente si la operación es binaria,
+        o lo normaliza a 0.0 si es una operación unaria como logaritmo.
+        """
+        if self.operacion != "logaritmo" and self.b is None:
+            raise ValueError("El campo 'b' es requerido para operaciones binarias.")
+        if self.operacion == "logaritmo" and self.b is None:
+            self.b = 0.0
+        return self
 
     # Este ejemplo aparece en la documentacion automatica de /docs.
     model_config = {
@@ -300,25 +313,34 @@ class SaludResponse(BaseModel):
 @app.post("/api/calcular", response_model=OperacionResponse, tags=["calculadora"])
 def calcular(datos: OperacionRequest) -> OperacionResponse:
     """
-    Recibe dos numeros y una operacion, devuelve el resultado.
+    Recibe los números y la operación, devuelve el resultado.
 
     Cuando esta funcion arranca, `datos` YA esta validado: a y b son floats de
-    verdad y operacion es una de las cuatro permitidas. Por eso el cuerpo puede
+    verdad y operacion es una de las permitidas. Por eso el cuerpo puede
     ser tan corto — el trabajo sucio lo hizo Pydantic antes de llegar aca.
     """
     simbolo, calcular_fn = OPERACIONES[datos.operacion]
+    b_valor = datos.b if datos.b is not None else 0.0
 
     # Regla de negocio 1: division por cero. Pydantic no puede validarla sola
     # porque depende de la COMBINACION de dos campos, no de uno solo.
-    if datos.operacion == "division" and datos.b == 0:
+    if datos.operacion == "division" and b_valor == 0:
         # 400 = "vos me mandaste algo que no puedo procesar".
         # No es un 500: el servidor esta perfecto, el pedido es el invalido.
         raise HTTPException(status_code=400, detail="No se puede dividir por cero.")
 
-    resultado = calcular_fn(datos.a, datos.b)
+    # Regla de negocio 2: logaritmo en base 10 de números no positivos.
+    # En los números reales, log10 solo está definido para a > 0.
+    if datos.operacion == "logaritmo" and datos.a <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="El logaritmo solo está definido para números mayores a cero (a > 0).",
+        )
 
-    # Regla de negocio 2: el resultado tiene que entrar en un float.
-    # Los dos operandos pueden ser finitos y perfectamente validos, y aun asi
+    resultado = calcular_fn(datos.a, b_valor)
+
+    # Regla de negocio 3: el resultado tiene que entrar en un float.
+    # Los operandos pueden ser finitos y perfectamente validos, y aun asi
     # su resultado desbordarse: 1e308 * 10 da infinito. Y aca esta el detalle
     # que sorprende a todo el mundo: INFINITO NO EXISTE EN JSON. El estandar no
     # lo contempla.
@@ -336,7 +358,10 @@ def calcular(datos: OperacionRequest) -> OperacionResponse:
             ),
         )
 
-    expresion = f"{datos.a} {simbolo} {datos.b} = {resultado}"
+    if datos.operacion == "logaritmo":
+        expresion = f"log₁₀({datos.a}) = {resultado}"
+    else:
+        expresion = f"{datos.a} {simbolo} {b_valor} = {resultado}"
 
     # El guardado va DESPUES de que la cuenta salio bien, y no puede fallar
     # hacia afuera: db.guardar() se traga cualquier error y lo manda al log.
@@ -348,7 +373,7 @@ def calcular(datos: OperacionRequest) -> OperacionResponse:
     # por no poder escribir una fila que a nadie le urge.
     db.guardar(
         a=datos.a,
-        b=datos.b,
+        b=b_valor,
         operacion=datos.operacion,
         simbolo=simbolo,
         resultado=resultado,
@@ -357,7 +382,7 @@ def calcular(datos: OperacionRequest) -> OperacionResponse:
 
     return OperacionResponse(
         a=datos.a,
-        b=datos.b,
+        b=b_valor,
         operacion=datos.operacion,
         simbolo=simbolo,
         resultado=resultado,

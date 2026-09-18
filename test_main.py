@@ -33,13 +33,26 @@ client = TestClient(app)
         ("multiplicacion", 3, 0, 0),
         ("division", 10, 4, 2.5),
         ("division", -9, 3, -3),
+        ("logaritmo", 100, 0, 2.0),
+        ("logaritmo", 1, 0, 0.0),
+        ("logaritmo", 1000, 0, 3.0),
+        ("logaritmo", 0.1, 0, -1.0),
     ],
 )
 def test_calcula_correctamente(operacion, a, b, esperado):
     respuesta = client.post("/api/calcular", json={"a": a, "b": b, "operacion": operacion})
 
     assert respuesta.status_code == 200
-    assert respuesta.json()["resultado"] == esperado
+    assert respuesta.json()["resultado"] == pytest.approx(esperado)
+
+
+def test_logaritmo_sin_campo_b():
+    respuesta = client.post("/api/calcular", json={"a": 100, "operacion": "logaritmo"})
+
+    assert respuesta.status_code == 200
+    assert respuesta.json()["resultado"] == 2.0
+    assert respuesta.json()["expresion"] == "log₁₀(100.0) = 2.0"
+    assert respuesta.json()["simbolo"] == "log₁₀"
 
 
 def test_la_respuesta_incluye_la_expresion_legible():
@@ -59,6 +72,14 @@ def test_division_por_cero_devuelve_400_y_no_revienta():
 
     assert respuesta.status_code == 400
     assert "cero" in respuesta.json()["detail"].lower()
+
+
+@pytest.mark.parametrize("a_invalido", [0, -1, -100])
+def test_logaritmo_no_positivo_devuelve_400(a_invalido):
+    respuesta = client.post("/api/calcular", json={"a": a_invalido, "operacion": "logaritmo"})
+
+    assert respuesta.status_code == 400
+    assert "mayor" in respuesta.json()["detail"].lower() or "cero" in respuesta.json()["detail"].lower()
 
 
 def test_operacion_desconocida_devuelve_422():
